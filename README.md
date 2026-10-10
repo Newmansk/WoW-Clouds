@@ -13,11 +13,11 @@ Dynamic Clouds replaces the original cloud system in World of Warcraft Vanilla 1
 
 ### Dynamic Cloud Movement
 
-https://github.com/Newmansk/WoW-Clouds/blob/main/media/clear%20clouds.gif
+/media/clear%20clouds.gif
 
 ### Weather-Reactive Cloud Density
 
-https://github.com/Newmansk/WoW-Clouds/blob/main/media/rain%20clouds.gif
+/media/rain%20clouds.gif
 
 ## Compatibility (Tested)
 
