@@ -52,8 +52,13 @@ struct Config {
     float coverage = 0.55f;      // 0..1
     float softness = 0.06f;
     float opacity = 0.95f;
+    float thrFloor = -0.20f;     // Shader threshold when effective coverage = 1.0 (see DrawClouds). 
+// Must be below the actual minimum of the fbm5 noise (~0 in theory,
+// but in practice it rarely drops below ~0.2–0.3) to avoid
+// clear-sky gaps when coverage=1. A more negative value results in a
+// "flatter" sky (less density variation) when fully overcast.
 
-    //-- Rain transition parameters --
+//-- Rain transition parameters --
     float rainCoverage = 1.0f;    // cloud cover with active weather (rain/snow/dust)
     float rainOpacity = 1.00f;    // cloud opacity with active weather
     float rainDarken = 0.55f;     // 1 = no change, lower = darker
@@ -200,6 +205,7 @@ static void LoadConfig() {
     c.coverage = ReadF("Coverage", c.coverage);
     c.softness = ReadF("Softness", c.softness);
     c.opacity = ReadF("Opacity", c.opacity);
+    c.thrFloor = ReadF("ThrFloor", c.thrFloor);
 
     // -- Rain transition stuff --
     c.rainCoverage = ReadF("RainCoverage", c.rainCoverage);
@@ -680,7 +686,12 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
     float dayTransparencyFactor = 1.0f - g_cfg.dayTransparencyAmount * g_dayness * (1.0f - g_rainBlend);
     opaBase *= dayTransparencyFactor;
 
-    float thr = 0.74f + (0.36f - 0.74f) * cov;
+    // (Non-linear) curve instead of linear interpolation: for a given intermediate "cov" value (e.g., the default 
+    // Coverage=0.55, with no rain), the threshold remains practically the same as before; however, as it approaches 
+    // cov=1.0 (RainCoverage=1.0 with active rain), it drops to g_cfg.thrFloor—which, by default, is lower than the 
+    // actual noise minimum—thereby ensuring no clear-sky gaps remain. Previously, the floor was fixed at 0.36, a 
+    // level the fbm5 noise frequently reaches.
+    float thr = 0.74f + (g_cfg.thrFloor - 0.74f) * powf(cov, 2.5f);
     float t = (float)fmod(NowSec() * g_cfg.timeScale, 36000.0);
     float lit[3], sh[3];
     ComputeColors(lit, sh);
