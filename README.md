@@ -63,7 +63,7 @@ The configuration file is automatically reloaded while the game is running, so r
 
 ## Credits
 
-- **Author:** Newmans
+- **Author:** Newmansk
 - **Development assistance:** Claude (Anthropic)
 
 ### Special Thanks
