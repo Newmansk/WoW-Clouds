@@ -35,8 +35,6 @@ Compatibility may vary depending on the client version, hardware, drivers, and c
 ## Dependencies
 
 - **VanillaFixes**, including `VanillaFixes.exe` and its `dlls.txt` configuration file.
-- `wow_clouds.dll`
-- `wow_clouds.ini`
 
 VanillaFixes is an external dependency and must be installed and configured separately.
 
