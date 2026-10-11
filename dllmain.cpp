@@ -64,6 +64,18 @@ struct Config {
     float rainDarken = 0.55f;     // 1 = no change, lower = darker
     float rainBlendSpeed = 0.6f;  // how fast the transition occurs (per second)
 
+    // Fade speed when entering/exiting a [Preset:...] by AreaId (units/sec; same
+    // mechanism as RainBlendSpeed ​​but applied directly to each value, rather than a single 0–1 factor—
+    // this works well even when transitioning directly from one preset to another without passing through a "base" zone).
+    float zoneBlendSpeed = 0.6f;
+    // Optional per-field overrides (defaulting to ZoneBlendSpeed) — useful because
+    // CoverageAdd typically has a much shorter travel distance than Darken/SpeedMult;
+    // at the same speed (units/sec), it reaches its target sooner, making it feel "faster"
+    // even though it isn't really.
+    float zoneDarkenBlendSpeed = 0.6f;
+    float zoneSpeedBlendSpeed = 0.6f;
+    float zoneCoverageBlendSpeed = 0.6f;
+
     // -- Extra daytime transparency, only in clear weather --
     // Uses the same actual sky color (g_skyVColor) and the same SkyLumNight/SkyLumDay 
     // thresholds already used for cloud night-darkening (ComputeColors), so no new memory 
@@ -99,6 +111,33 @@ struct Config {
     // use it only for short, specific tests to see if the pulse lasts less than 60 frames.
     int   wxRawEveryFrame = 0;
 
+    // Experimental read of 0x86f694 (see minimap.md). Not yet confirmed on this build; disabled by
+    // default until confirmed safe. 1 = log the map id every second (does not change behavior).
+    int   mapLog = 0;
+    // 0x00B71EA8: AreaId, confirmed by the user (see note next to ReadClientAreaId). 1 = log
+    // every second. It doesn't handle any effects yet, but unlike mapLog/zoneLog, this
+    // address is already verified and ready to connect to something real once the log is confirmed.
+    int   areaLog = 0;
+    // 1 = logs the active preset and the smoothed values ​​every second (see g_zoneDarken, etc.)
+    int   presetLog = 0;
+    // Same for 0xB56F50/0xB56F58 (zone/sub-zone text), unconfirmed. Logging only.
+    int   zoneLog = 0;
+
+    // Memory scan to find the actual address of the zone text without Cheat Engine. 
+    // Step 1: Position yourself at ZoneScanTarget1 and set ZoneScan1=1 -> saves all addresses
+    // containing that text. Step 2: Walk to the neighboring zone, set ZoneScanTarget2 and ZoneScan2=1 ->
+    // retains only the candidates that now contain that other text.
+    char  zoneScanTarget1[64] = "";
+    char  zoneScanTarget2[64] = "";
+    int   zoneScan1 = 0;
+    int   zoneScan2 = 0;
+
+    // Experimental: candidate address for FrameScript_ExecuteBuffer (runs "/script ..."), from the
+    // documented vanilla 1.12.1.5875 offset. 1 = fire a single harmless test script once, on the
+    // next frame after reload, that prints to the chat frame. Always goes back to 0 right after,
+    // so it never repeats; set it back to 1 in the ini to fire again.
+    int   luaProbe = 0;
+
     float windX = 0.030f, windY = 0.012f;
     float horizonFade = 0.20f;
     float sunAz = 45.0f, sunEl = 50.0f;   // degrees
@@ -119,6 +158,19 @@ enum { WX_UNKNOWN = -1, WX_CLEAR = 0, WX_RAIN = 1, WX_SNOW = 2, WX_SAND = 3 };
 static volatile int g_weather = WX_CLEAR;
 static float g_rainBlend = 0.0f;   // 0 = normal weather, 1 = full rain
 static double g_lastBlendTime = -1.0;   // to measure the actual time between frames (independent of FPS)
+
+// Accumulated effective time (replaces NowSec()*TimeScale for cloud evolution/wind).
+// It is incremented once per frame in H_Present by the actual dt, multiplied by TimeScale and
+// by the g_zoneSpeedMult (already updated for that frame)—this ensures the zone preset
+// deceleration is truly gradual, rather than recalculating "time * speed" each time
+// (which would cause stuttering, since the speed changes incrementally during the transition).
+static double g_animTime = 0.0;
+
+// Zone preset values, already smoothed (see the blend block in H_Present). They start at
+// neutral values ​​(with no active preset).
+static float g_zoneDarken = 1.0f;
+static float g_zoneSpeedMult = 1.0f;
+static float g_zoneCoverageAdd = 0.0f;
 
 static bool   g_wxBaselineInit = false;
 static float  g_wxBaseline = 0.0f;     // baseline: follows the actual color slowly
@@ -150,6 +202,108 @@ static float ReadF(const char* key, float def) {
     snprintf(dbuf, sizeof dbuf, "%g", def);
     GetPrivateProfileStringA("Clouds", key, dbuf, buf, sizeof buf, g_iniPath);
     return (float)atof(buf);
+}
+// Same as ReadF but from an arbitrary section (for [Preset:Name]).
+static float ReadFSection(const char* section, const char* key, float def) {
+    char buf[64], dbuf[64];
+    snprintf(dbuf, sizeof dbuf, "%g", def);
+    GetPrivateProfileStringA(section, key, dbuf, buf, sizeof buf, g_iniPath);
+    return (float)atof(buf);
+}
+
+// -- Zone presets by AreaId --------------------------------------------------------------
+// Each preset is a [Preset:Name] section within the same .ini file. They are auto-discovered
+// (no master list is required): any section starting with "Preset:" loads automatically.
+// AreaIds=46,51          -> List of AreaIds (0x00B71EA8, confirmed) that activate this preset.
+// Darken=0.6             -> 1.0 = no change; uses the same units as RainDarken (lower value = darker).
+// SpeedMult=0.5          -> 1.0 = no change; multiplies TimeScale.
+// CoverageAdd=0.1        -> 0.0 = no change; added to Coverage.
+// If an AreaId appears in more than one preset, the first one loaded (based on .ini file order)
+// takes precedence and a warning is logged; the others simply ignore that AreaId.
+#define MAX_ZONE_PRESETS 16
+#define MAX_IDS_PER_PRESET 32
+
+struct ZonePreset {
+    char  name[48];
+    int   areaIds[MAX_IDS_PER_PRESET];
+    int   areaCount;
+    float darken;
+    float speedMult;
+    float coverageAdd;
+};
+
+static ZonePreset g_zonePresets[MAX_ZONE_PRESETS];
+static int        g_zonePresetCount = 0;
+
+// true if areaId is already assigned to a preset loaded before presetIdxExclusive (to
+// detect duplicates during loading). Returns the index of the owning preset, or -1 if none.
+static int FindPresetOwningArea(int areaId, int presetIdxExclusive) {
+    for (int p = 0; p < presetIdxExclusive; p++) {
+        for (int i = 0; i < g_zonePresets[p].areaCount; i++) {
+            if (g_zonePresets[p].areaIds[i] == areaId) return p;
+        }
+    }
+    return -1;
+}
+
+static void LoadZonePresets() {
+    g_zonePresetCount = 0;
+
+    char sectionNames[8192];
+    DWORD len = GetPrivateProfileSectionNamesA(sectionNames, sizeof(sectionNames), g_iniPath);
+    if (len == 0) return;
+
+    for (char* name = sectionNames; *name; name += strlen(name) + 1) {
+        if (strncmp(name, "Preset:", 7) != 0) continue;
+        if (g_zonePresetCount >= MAX_ZONE_PRESETS) {
+            LogAlways("[PRESET] Maximum of %d presets reached; ignoring \"%s\"", MAX_ZONE_PRESETS, name);
+            continue;
+        }
+
+        ZonePreset& pr = g_zonePresets[g_zonePresetCount];
+        strncpy(pr.name, name + 7, sizeof(pr.name) - 1);
+        pr.name[sizeof(pr.name) - 1] = 0;
+        pr.areaCount = 0;
+        pr.darken = ReadFSection(name, "Darken", 1.0f);
+        pr.speedMult = ReadFSection(name, "SpeedMult", 1.0f);
+        pr.coverageAdd = ReadFSection(name, "CoverageAdd", 0.0f);
+
+        char idsBuf[512];
+        GetPrivateProfileStringA(name, "AreaIds", "", idsBuf, sizeof idsBuf, g_iniPath);
+        for (const char* p = idsBuf; *p;) {
+            while (*p && (*p < '0' || *p > '9')) p++;
+            if (!*p) break;
+            int id = atoi(p);
+            while (*p >= '0' && *p <= '9') p++;
+
+            int owner = FindPresetOwningArea(id, g_zonePresetCount);
+            if (owner >= 0) {
+                LogAlways("[PRESET] AreaId %d already belongs to \"%s\"; ignored in \"%s\"",
+                    id, g_zonePresets[owner].name, pr.name);
+                continue;
+            }
+            if (pr.areaCount < MAX_IDS_PER_PRESET) {
+                pr.areaIds[pr.areaCount++] = id;
+            }
+            else {
+                LogAlways("[PRESET] \"%s\" reached the maximum of %d AreaIds, ignoring %d", pr.name, MAX_IDS_PER_PRESET, id);
+            }
+        }
+
+        LogAlways("[PRESET] loaded \"%s\": %d zone(s), Darken=%.2f SpeedMult=%.2f CoverageAdd=%.2f",
+            pr.name, pr.areaCount, pr.darken, pr.speedMult, pr.coverageAdd);
+        g_zonePresetCount++;
+    }
+}
+
+// Searches for the preset containing areaId. Returns the index, or -1 if none is found ("base" zone).
+static int FindPresetForArea(int areaId) {
+    for (int p = 0; p < g_zonePresetCount; p++) {
+        for (int i = 0; i < g_zonePresets[p].areaCount; i++) {
+            if (g_zonePresets[p].areaIds[i] == areaId) return p;
+        }
+    }
+    return -1;
 }
 static void ReadColor(const char* key, float out[3]) {
     char buf[96];
@@ -212,6 +366,10 @@ static void LoadConfig() {
     c.rainOpacity = ReadF("RainOpacity", c.rainOpacity);
     c.rainDarken = ReadF("RainDarken", c.rainDarken);
     c.rainBlendSpeed = ReadF("RainBlendSpeed", c.rainBlendSpeed);
+    c.zoneBlendSpeed = ReadF("ZoneBlendSpeed", c.zoneBlendSpeed);
+    c.zoneDarkenBlendSpeed = ReadF("ZoneDarkenBlendSpeed", c.zoneBlendSpeed);
+    c.zoneSpeedBlendSpeed = ReadF("ZoneSpeedBlendSpeed", c.zoneBlendSpeed);
+    c.zoneCoverageBlendSpeed = ReadF("ZoneCoverageBlendSpeed", c.zoneBlendSpeed);
     c.dayTransparencyEnabled = (int)ReadF("DayTransparencyEnabled", (float)c.dayTransparencyEnabled);
     c.dayTransparencyAmount = ReadF("DayTransparencyAmount", c.dayTransparencyAmount);
 
@@ -222,6 +380,15 @@ static void LoadConfig() {
     c.wxJumpRate = ReadF("WxJumpRate", c.wxJumpRate);
     c.wxJumpWindow = ReadF("WxJumpWindow", c.wxJumpWindow);
     c.wxLog = (int)ReadF("WxLog", (float)c.wxLog);
+    c.mapLog = (int)ReadF("MapLog", (float)c.mapLog);
+    c.areaLog = (int)ReadF("AreaLog", (float)c.areaLog);
+    c.presetLog = (int)ReadF("PresetLog", (float)c.presetLog);
+    c.zoneLog = (int)ReadF("ZoneLog", (float)c.zoneLog);
+    GetPrivateProfileStringA("Clouds", "ZoneScanTarget1", "", c.zoneScanTarget1, sizeof(c.zoneScanTarget1), g_iniPath);
+    GetPrivateProfileStringA("Clouds", "ZoneScanTarget2", "", c.zoneScanTarget2, sizeof(c.zoneScanTarget2), g_iniPath);
+    c.zoneScan1 = (int)ReadF("ZoneScan1", 0);
+    c.zoneScan2 = (int)ReadF("ZoneScan2", 0);
+    c.luaProbe = (int)ReadF("LuaProbe", (float)c.luaProbe);
     c.wxRawProbe = (int)ReadF("WxRawProbe", (float)c.wxRawProbe);
     c.wxUseSlots = (int)ReadF("WxUseSlots", (float)c.wxUseSlots);
     c.wxUsePulse = (int)ReadF("WxUsePulse", (float)c.wxUsePulse);
@@ -238,6 +405,7 @@ static void LoadConfig() {
     ReadColor("ShadowColor", c.shadowColor);
 
     g_cfg = c;
+    LoadZonePresets();
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (GetFileAttributesExA(g_iniPath, GetFileExInfoStandard, &fad)) g_iniTime = fad.ftLastWriteTime;
 }
@@ -603,7 +771,9 @@ static void ComputeColors(float lit[3], float sh[3]) {
             sh[i] = lit[i] * g_cfg.shadowColor[i];
         }
     }
-    float dk = 1.0f - (1.0f - g_cfg.rainDarken) * g_rainBlend;
+    // dk combines the rain darkening (g_rainBlend) with that of the active zone preset
+    // (g_zoneDarken); both use the same units (1.0 = no change), so they are multiplied.
+    float dk = (1.0f - (1.0f - g_cfg.rainDarken) * g_rainBlend) * g_zoneDarken;
     for (int i = 0; i < 3; i++) { lit[i] *= dk; sh[i] *= dk; }
 }
 
@@ -675,7 +845,7 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
     //float cov = g_cfg.coverage < 0 ? 0 : (g_cfg.coverage > 1 ? 1 : g_cfg.coverage);
 
     // -- Rain transition stuff start --
-    float covBase = g_cfg.coverage + (g_cfg.rainCoverage - g_cfg.coverage) * g_rainBlend;
+    float covBase = g_cfg.coverage + (g_cfg.rainCoverage - g_cfg.coverage) * g_rainBlend + g_zoneCoverageAdd;
     float cov = covBase < 0 ? 0 : (covBase > 1 ? 1 : covBase);
     float opaBase = g_cfg.opacity + (g_cfg.rainOpacity - g_cfg.opacity) * g_rainBlend;
     // -- Rain transition stuff end --
@@ -686,13 +856,13 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
     float dayTransparencyFactor = 1.0f - g_cfg.dayTransparencyAmount * g_dayness * (1.0f - g_rainBlend);
     opaBase *= dayTransparencyFactor;
 
-    // (Non-linear) curve instead of linear interpolation: for a given intermediate "cov" value (e.g., the default 
-    // Coverage=0.55, with no rain), the threshold remains practically the same as before; however, as it approaches 
-    // cov=1.0 (RainCoverage=1.0 with active rain), it drops to g_cfg.thrFloor—which, by default, is lower than the 
-    // actual noise minimum—thereby ensuring no clear-sky gaps remain. Previously, the floor was fixed at 0.36, a 
-    // level the fbm5 noise frequently reaches.
+    // (Non-linear) curve instead of linear interpolation: for a given intermediate "cov" value (e.g., the
+    // default Coverage=0.55, without rain), the threshold remains practically the same as before, but as
+    // it approaches cov=1.0 (RainCoverage=1.0 with active rain), it drops to g_cfg.thrFloor—which, by
+    // default, is lower than the actual noise minimum—ensuring there are no gaps of clear sky. 
+    // Previously, the floor was fixed at 0.36, a level the fbm5 noise frequently reaches.
     float thr = 0.74f + (g_cfg.thrFloor - 0.74f) * powf(cov, 2.5f);
-    float t = (float)fmod(NowSec() * g_cfg.timeScale, 36000.0);
+    float t = (float)fmod(g_animTime, 36000.0);
     float lit[3], sh[3];
     ComputeColors(lit, sh);
     float psc[36] = {
@@ -1243,6 +1413,143 @@ static int ReadClientWeatherSlots() {
     }
 }
 
+// 0x86f694 (vanilla 1.12.1, per minimap.md): current continent/instance mapId, s32, -1 = none yet
+// (loading screen). NOT YET CONFIRMED on this 1.18.1 build -- logged only (MapLog=1), not used by
+// any effect, until verified by crossing a continent portal/instance and checking the log.
+static int ReadClientMapId() {
+    __try {
+        DWORD base = (DWORD)GetModuleHandleA(NULL);
+        DWORD addr = base + (0x86f694 - 0x400000);
+        return (int)(*(volatile DWORD*)addr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -3;   // invalid read (address not mapped)
+    }
+}
+
+// 0x00B71EA8: Current AreaId (zone/sub-zone). Found and confirmed by the user using Cheat Engine
+// (ID search, eliminating candidates, validated by cross-referencing a full client restart).
+// Unlike the candidates listed below, THIS address IS verified for this build.
+static int ReadClientAreaId() {
+    __try {
+        DWORD base = (DWORD)GetModuleHandleA(NULL);
+        DWORD addr = base + (0x00b71ea8 - 0x400000);
+        return (int)(*(volatile DWORD*)addr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -3;   // invalid read (address not mapped)
+    }
+}
+
+// UNCONFIRMED candidates (source: third-party search, unverified; see chat note) for
+// 1.12.1.5875: 0xB56F50 = current zone text buffer, 0xB56F58 = subzone. These are read-only;
+// nothing is ever written or executed, so the worst-case scenario is garbage data or a caught exception.
+static bool ReadCStrSafe(DWORD addr, char* out, size_t outCap) {
+    if (!out || outCap == 0) return false;
+    __try {
+        const volatile char* p = (const volatile char*)addr;
+        size_t i = 0;
+        for (; i < outCap - 1; ++i) {
+            char c = p[i];
+            if (c == 0) break;
+            if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7e) { out[0] = 0; return false; } // basura, no es texto
+            out[i] = c;
+        }
+        out[i] = 0;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = 0;
+        return false;   // direccion no mapeada / invalida
+    }
+}
+
+// Memory scanning without external tools (replaces manual work in Cheat Engine).
+// ScanProcessForString uses VirtualQuery to iterate only over the committed and readable regions of
+// the process, searching for the exact text `needle` (excluding the trailing quote), and stores
+// every address where it appears. It only reads memory; it never writes or executes anything.
+// Each region is scanned within a __try/__except block in case it becomes inaccessible during the scan.
+static DWORD g_zoneCandidates[8192];
+static int   g_zoneCandidateCount = 0;
+
+static int ScanProcessForString(const char* needle, DWORD* out, int outCap) {
+    size_t needleLen = strlen(needle);
+    if (needleLen == 0) return 0;
+    int found = 0;
+    BYTE* addr = NULL;
+    MEMORY_BASIC_INFORMATION mbi;
+    while ((DWORD)addr < 0x7ff00000 && VirtualQuery(addr, &mbi, sizeof mbi) == sizeof mbi) {
+        BYTE readable = (mbi.State == MEM_COMMIT) &&
+            !(mbi.Protect & PAGE_GUARD) && !(mbi.Protect & PAGE_NOACCESS) &&
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY));
+        if (readable && mbi.RegionSize > needleLen) {
+            __try {
+                BYTE* base = (BYTE*)mbi.BaseAddress;
+                SIZE_T size = mbi.RegionSize;
+                for (SIZE_T i = 0; i + needleLen <= size; i++) {
+                    if (base[i] == (BYTE)needle[0] && memcmp(base + i, needle, needleLen) == 0) {
+                        if (found < outCap) out[found] = (DWORD)(base + i);
+                        found++;
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                // The region became inaccessible during the scan; it is being skipped.
+            }
+        }
+        addr = (BYTE*)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return found;
+}
+
+// Second pass: keep only the candidates that now contain `needle` (the neighboring area).
+static void FilterZoneCandidates(const char* needle) {
+    size_t needleLen = strlen(needle);
+    int kept = 0;
+    for (int i = 0; i < g_zoneCandidateCount; i++) {
+        DWORD a = g_zoneCandidates[i];
+        BOOL match = FALSE;
+        __try {
+            if (memcmp((const void*)a, needle, needleLen) == 0) match = TRUE;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { match = FALSE; }
+        if (match) g_zoneCandidates[kept++] = a;
+    }
+    g_zoneCandidateCount = kept;
+}
+
+static bool ReadClientZoneText(char* out, size_t outCap) {
+    DWORD base = (DWORD)GetModuleHandleA(NULL);
+    return ReadCStrSafe(base + (0x00b56f50 - 0x400000), out, outCap);
+}
+
+static bool ReadClientSubZoneText(char* out, size_t outCap) {
+    DWORD base = (DWORD)GetModuleHandleA(NULL);
+    return ReadCStrSafe(base + (0x00b56f58 - 0x400000), out, outCap);
+}
+
+// Candidate for FrameScript_ExecuteBuffer (runs an arbitrary Lua chunk, same as typing "/script ...").
+// Documented address for the stock vanilla 1.12.1.5875 client: 0x00704CD0, signature
+// int __cdecl(const char* code, const char* chunkname). NOT YET CONFIRMED on this 1.18.1 build --
+// only called once via LuaProbe=1, never on the hot path, until verified.
+typedef int(__cdecl* FrameScriptExecuteBuffer_t)(const char* code, const char* chunkname);
+
+// Fires one harmless test script ("DEFAULT_CHAT_FRAME:AddMessage(...)") and returns true if the
+// call itself didn't crash. Whether it actually worked is confirmed by seeing the message in the
+// in-game chat -- this only guards against the call faulting.
+static bool TestFrameScriptExecuteBuffer() {
+    __try {
+        DWORD base = (DWORD)GetModuleHandleA(NULL);
+        FrameScriptExecuteBuffer_t fn = (FrameScriptExecuteBuffer_t)(base + (0x00704cd0 - 0x400000));
+        const char* code = "DEFAULT_CHAT_FRAME:AddMessage(\"[wow_clouds] LuaProbe ok\")";
+        fn(code, "wow_clouds_probe");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Holds the last valid pulse (0-3) seen in CMapWeather+0x20, since the field itself
 // only holds it for a few seconds before reverting to -1. Call once per frame.
 static void UpdatePulseWeather() {
@@ -1315,6 +1622,71 @@ static HRESULT STDMETHODCALLTYPE H_Present(IDirect3DDevice9* d, const RECT* a, c
         }
     }
 
+    // Diagnostic, not yet used by any effect: confirm 0x86f694 by crossing a portal/
+    // zeppelin between continents or entering an instance and seeing if the value changes as expected.
+    if (g_cfg.mapLog && (g_frame % 60) == 0) {
+        int mapId = ReadClientMapId();
+        LogAlways("[MAPID] frame=%lu 0x86f694=%d", (unsigned long)g_frame, mapId);
+    }
+
+    // Unconfirmed diagnosis (third-party address, unverified): compare against what
+    // you see on screen when moving between zones. "ok=0" means the reading failed or did not look like text.
+    if (g_cfg.zoneLog && (g_frame % 60) == 0) {
+        char zone[64], subzone[64];
+        bool okZ = ReadClientZoneText(zone, sizeof(zone));
+        bool okS = ReadClientSubZoneText(subzone, sizeof(subzone));
+        LogAlways("[ZONETXT] frame=%lu zone=\"%s\" (ok=%d) subzone=\"%s\" (ok=%d)",
+            (unsigned long)g_frame, okZ ? zone : "", (int)okZ, okS ? subzone : "", (int)okS);
+    }
+
+    // AreaId confirmed by the user using Cheat Engine. To validate the log: walk between a
+    // couple of zones/sub-zones and check that the number changes at the expected times.
+    if (g_cfg.areaLog && (g_frame % 60) == 0) {
+        int areaId = ReadClientAreaId();
+        LogAlways("[AREAID] frame=%lu 0x00B71EA8=%d", (unsigned long)g_frame, areaId);
+    }
+
+    // Memory scan (without Cheat Engine): step 1, save all addresses with
+    // ZoneScanTarget1. It may take a second or two and cause a one-frame hitch; this is
+    // intentional and only triggered manually.
+    static int s_lastZoneScan1 = 0;
+    if (g_cfg.zoneScan1 && !s_lastZoneScan1) {
+        int totalFound = ScanProcessForString(g_cfg.zoneScanTarget1, g_zoneCandidates, 8192);
+        g_zoneCandidateCount = totalFound < 8192 ? totalFound : 8192;
+        LogAlways("[ZONESCAN] step 1: \"%s\" appears %d times in memory (%d saved)",
+            g_cfg.zoneScanTarget1, totalFound, g_zoneCandidateCount);
+        if (g_zoneCandidateCount <= 200) {
+            for (int i = 0; i < g_zoneCandidateCount; i++)
+                LogAlways("[ZONESCAN] candidate[%d] = 0x%08lX", i, g_zoneCandidates[i]);
+        }
+        else {
+            LogAlways("[ZONESCAN] too many matches to list; walk to the neighboring zone and use ZoneScan2 to filter");
+        }
+    }
+    s_lastZoneScan1 = g_cfg.zoneScan1;
+
+    // Step 2: Keep only the candidates from Step 1 that now contain ZoneScanTarget2.
+    static int s_lastZoneScan2 = 0;
+    if (g_cfg.zoneScan2 && !s_lastZoneScan2) {
+        int before = g_zoneCandidateCount;
+        FilterZoneCandidates(g_cfg.zoneScanTarget2);
+        LogAlways("[ZONESCAN] step 2: \"%s\" -> %d of %d candidates remained",
+            g_cfg.zoneScanTarget2, g_zoneCandidateCount, before);
+        for (int i = 0; i < g_zoneCandidateCount; i++)
+            LogAlways("[ZONESCAN] sobreviviente[%d] = 0x%08lX", i, g_zoneCandidates[i]);
+    }
+    s_lastZoneScan2 = g_cfg.zoneScan2;
+
+    // One-time test (does not repeat automatically): triggers when LuaProbe changes from 0 to 1 in the .ini file. If the message
+    // "[wow_clouds] LuaProbe ok" appears in the in-game chat, 0x00704CD0 is confirmed.
+    static int s_lastLuaProbe = 0;
+    if (g_cfg.luaProbe && !s_lastLuaProbe) {
+        bool called = TestFrameScriptExecuteBuffer();
+        LogAlways("[LUAPROBE] frame=%lu called=%d (check the in-game chat to confirm)",
+            (unsigned long)g_frame, (int)called);
+    }
+    s_lastLuaProbe = g_cfg.luaProbe;
+
     // The effect (coverage/opacity/darkening) applies equally to rain, snow, and dust;
     // Only clearing the sky leaves the clouds in their normal state.
     float rainTarget = (g_weather == WX_RAIN || g_weather == WX_SNOW || g_weather == WX_SAND) ? 1.0f : 0.0f;
@@ -1324,6 +1696,36 @@ static HRESULT STDMETHODCALLTYPE H_Present(IDirect3DDevice9* d, const RECT* a, c
     float step = g_cfg.rainBlendSpeed * dt;
     if (g_rainBlend < rainTarget) { g_rainBlend += step; if (g_rainBlend > rainTarget) g_rainBlend = rainTarget; }
     else if (g_rainBlend > rainTarget) { g_rainBlend -= step; if (g_rainBlend < rainTarget) g_rainBlend = rainTarget; }
+
+    // Zone preset active by AreaId: each value (darken/speedMult/coverageAdd) transitions independently,
+    // at a rate of ZoneBlendSpeed ​​per second, toward the current preset's value (or toward neutral if none
+    // is active). Since it does not rely on a single 0–1 factor, it also handles direct transitions between
+    // presets well, without passing through a "base" zone.
+    {
+        int areaId = ReadClientAreaId();
+        int idx = FindPresetForArea(areaId);
+        float targetDarken = (idx >= 0) ? g_zonePresets[idx].darken : 1.0f;
+        float targetSpeedMult = (idx >= 0) ? g_zonePresets[idx].speedMult : 1.0f;
+        float targetCoverageAdd = (idx >= 0) ? g_zonePresets[idx].coverageAdd : 0.0f;
+        float zstepDarken = g_cfg.zoneDarkenBlendSpeed * dt;
+        float zstepSpeed = g_cfg.zoneSpeedBlendSpeed * dt;
+        float zstepCoverage = g_cfg.zoneCoverageBlendSpeed * dt;
+        if (g_zoneDarken < targetDarken) { g_zoneDarken += zstepDarken; if (g_zoneDarken > targetDarken) g_zoneDarken = targetDarken; }
+        else if (g_zoneDarken > targetDarken) { g_zoneDarken -= zstepDarken; if (g_zoneDarken < targetDarken) g_zoneDarken = targetDarken; }
+        if (g_zoneSpeedMult < targetSpeedMult) { g_zoneSpeedMult += zstepSpeed; if (g_zoneSpeedMult > targetSpeedMult) g_zoneSpeedMult = targetSpeedMult; }
+        else if (g_zoneSpeedMult > targetSpeedMult) { g_zoneSpeedMult -= zstepSpeed; if (g_zoneSpeedMult < targetSpeedMult) g_zoneSpeedMult = targetSpeedMult; }
+        if (g_zoneCoverageAdd < targetCoverageAdd) { g_zoneCoverageAdd += zstepCoverage; if (g_zoneCoverageAdd > targetCoverageAdd) g_zoneCoverageAdd = targetCoverageAdd; }
+        else if (g_zoneCoverageAdd > targetCoverageAdd) { g_zoneCoverageAdd -= zstepCoverage; if (g_zoneCoverageAdd < targetCoverageAdd) g_zoneCoverageAdd = targetCoverageAdd; }
+
+        // With the zoneSpeedMult for this frame already updated, the effective time is integrated.
+        g_animTime += (double)dt * g_cfg.timeScale * g_zoneSpeedMult;
+
+        if (g_cfg.presetLog && (g_frame % 60) == 0) {
+            const char* presetName = (idx >= 0) ? g_zonePresets[idx].name : "(ninguno)";
+            LogAlways("[ZONEPRESET] frame=%lu areaId=%d preset=\"%s\" darken=%.3f speedMult=%.3f coverageAdd=%.3f",
+                (unsigned long)g_frame, areaId, presetName, g_zoneDarken, g_zoneSpeedMult, g_zoneCoverageAdd);
+        }
+    }
 
     MaybeReloadConfig();
     return t->present(d, a, b, w, r);
