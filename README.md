@@ -19,6 +19,11 @@ Dynamic Clouds replaces the original cloud system in World of Warcraft Vanilla 1
 
 ![Image](https://github.com/Newmansk/WoW-Clouds/blob/main/media/rain%20clouds.gif)
 
+### New feature: Custom Zone Presets
+You can add presets for any zone in the game using their id and add it to a preset by wow_clouds.ini file
+
+![Image](https://github.com/Newmansk/WoW-Clouds/blob/main/media/zoneBlending.gif) 
+
 ## Compatibility (Tested)
 
 | Component | Configuration |
