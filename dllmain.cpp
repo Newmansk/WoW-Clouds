@@ -21,6 +21,29 @@
 #include <math.h>
 
 // ---------------------------------------------------------------------------------------------
+// Extra cloud layers (optional, off by default -- see [CloudsLayer2]/[CloudsLayer3] in the ini).
+// Layer 1 (the original/base layer) keeps using the top-level [Clouds] fields in Config below,
+// unchanged, so existing ini files keep working exactly as before.
+// ---------------------------------------------------------------------------------------------
+struct CloudLayerConfig {
+    int   enabled = 0;
+    float scale = 1.2f;
+    float coverage = 0.55f;
+    float softness = 0.06f;
+    float opacity = 0.95f;
+    float windX = 0.030f, windY = 0.012f;
+    float horizonFade = 0.20f;
+    float dome = 0.30f;
+    float evolve = 0.08f;
+    float detail = 1.5f;
+    float bandSoft = 0.07f;
+    float timeScale = 1.0f;
+    // Offsets this layer's noise field so it doesn't look like an exact copy of the other layers
+    // at a different scale. 0 = original/unshifted noise (this is what layer 1 always uses).
+    float noiseSeed = 0.0f;
+};
+
+// ---------------------------------------------------------------------------------------------
 // Configuration (wow_clouds.ini, with DLL; loads after saving)
 // ---------------------------------------------------------------------------------------------
 struct Config {
@@ -119,6 +142,12 @@ struct Config {
     float nightBrightness = 0.18f;
     float sunColor[3] = { 1.00f, 0.97f, 0.90f };
     float shadowColor[3] = { 0.52f, 0.60f, 0.78f };
+
+    // Optional extra layers for depth (farther/bigger -> closer/smaller). Both start disabled;
+    // see LoadConfig for their suggested non-zero defaults, and [CloudsLayer2]/[CloudsLayer3] in
+    // the ini to enable and tweak them.
+    CloudLayerConfig layer2;
+    CloudLayerConfig layer3;
 };
 
 static Config g_cfg;
@@ -139,6 +168,10 @@ static double g_lastBlendTime = -1.0;   // to measure the actual time between fr
 // deceleration is truly gradual, rather than recalculating "time * speed" each time
 // (which would cause stuttering, since the speed changes incrementally during the transition).
 static double g_animTime = 0.0;
+// Same idea as g_animTime, but WITHOUT TimeScale baked in (only dt * g_zoneSpeedMult), so layers 2
+// and 3 can each apply their own TimeScale at draw time without touching layer 1's accumulator
+// (which keeps it pixel-identical to before this feature existed).
+static double g_animTimeRaw = 0.0;
 
 // Zone preset values, already smoothed (see the blend block in H_Present). They start at
 // neutral values ​​(with no active preset).
@@ -185,6 +218,26 @@ static float ReadFSection(const char* section, const char* key, float def) {
     snprintf(dbuf, sizeof dbuf, "%g", def);
     GetPrivateProfileStringA(section, key, dbuf, buf, sizeof buf, g_iniPath);
     return (float)atof(buf);
+}
+
+// Loads one optional extra cloud layer from its own ini section ([CloudsLayer2]/[CloudsLayer3]).
+// lc is passed already filled with that layer's suggested defaults (see LoadConfig); any key
+// missing from the ini keeps the suggested default instead of falling back to layer 1's values.
+static void LoadExtraCloudLayer(const char* section, CloudLayerConfig& lc) {
+    lc.enabled = (int)ReadFSection(section, "Enabled", (float)lc.enabled);
+    lc.scale = ReadFSection(section, "Scale", lc.scale);
+    lc.coverage = ReadFSection(section, "Coverage", lc.coverage);
+    lc.softness = ReadFSection(section, "Softness", lc.softness);
+    lc.opacity = ReadFSection(section, "Opacity", lc.opacity);
+    lc.windX = ReadFSection(section, "WindX", lc.windX);
+    lc.windY = ReadFSection(section, "WindY", lc.windY);
+    lc.horizonFade = ReadFSection(section, "HorizonFade", lc.horizonFade);
+    lc.dome = ReadFSection(section, "Dome", lc.dome);
+    lc.evolve = ReadFSection(section, "Evolve", lc.evolve);
+    lc.detail = ReadFSection(section, "Detail", lc.detail);
+    lc.bandSoft = ReadFSection(section, "BandSoftness", lc.bandSoft);
+    lc.timeScale = ReadFSection(section, "TimeScale", lc.timeScale);
+    lc.noiseSeed = ReadFSection(section, "NoiseSeed", lc.noiseSeed);
 }
 
 // -- Zone presets by AreaId --------------------------------------------------------------
@@ -272,8 +325,10 @@ static void LoadZonePresets() {
             }
         }
 
-        LogAlways("[PRESET] loaded \"%s\": %d zone(s), Darken=%.2f SpeedMult=%.2f CoverageAdd=%.2f TintMix=%.2f WeatherBlendSpeedMult=%.2f",
-            pr.name, pr.areaCount, pr.darken, pr.speedMult, pr.coverageAdd, pr.tintMix, pr.weatherBlendSpeedMult);
+        if (g_cfg.presetLog) {
+            LogAlways("[PRESET] loaded \"%s\": %d zone(s), Darken=%.2f SpeedMult=%.2f CoverageAdd=%.2f TintMix=%.2f WeatherBlendSpeedMult=%.2f",
+                pr.name, pr.areaCount, pr.darken, pr.speedMult, pr.coverageAdd, pr.tintMix, pr.weatherBlendSpeedMult);
+        }
         g_zonePresetCount++;
     }
 }
@@ -379,6 +434,24 @@ static void LoadConfig() {
     ReadColor("SunColor", c.sunColor);
     ReadColor("ShadowColor", c.shadowColor);
 
+    // -- Extra cloud layers (depth) --
+    // Layer 2: a bit closer/smaller than layer 1 and a bit windier, so it visibly drifts faster.
+    c.layer2.scale = 2.2f;
+    c.layer2.coverage = 0.35f;
+    c.layer2.opacity = 0.90f;
+    c.layer2.windX = 0.045f;
+    c.layer2.windY = 0.018f;
+    c.layer2.noiseSeed = 41.0f;
+    // Layer 3: the closest/smallest, light coverage, fastest wind.
+    c.layer3.scale = 3.2f;
+    c.layer3.coverage = 0.20f;
+    c.layer3.opacity = 0.85f;
+    c.layer3.windX = 0.065f;
+    c.layer3.windY = 0.026f;
+    c.layer3.noiseSeed = 97.0f;
+    LoadExtraCloudLayer("CloudsLayer2", c.layer2);
+    LoadExtraCloudLayer("CloudsLayer3", c.layer3);
+
     g_cfg = c;
     LoadZonePresets();
     WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -426,6 +499,7 @@ float4 P5 : register(c5); // Axis 2 of the cloud plane
 float4 P6 : register(c6); // illuminated color
 float4 P7 : register(c7); // shadow color
 float4 P8 : register(c8); // x = evolution (change in shape) y = detail (weight of fine octaves) z = band smoothness
+float4 P9 : register(c9); // xy = per-layer noise offset (keeps extra layers from looking like an exact copy)
 
 float hash12(float2 p) {
     float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
@@ -479,7 +553,7 @@ float4 main(float3 dir : TEXCOORD0) : COLOR {
 
     // Projection onto a plane of clouds: near the horizon, the clouds appear smaller and more tightly packed.
     float2 uv = float2(dot(d, P4.xyz), dot(d, P5.xyz)) / max(h + P2.w, 0.05);
-    float2 p = uv * P0.y + float2(P1.x, P1.y) * P0.x;
+    float2 p = uv * P0.y + float2(P1.x, P1.y) * P0.x + P9.xy;
 
     float n = fbm5(p, P0.x, P8.x, P8.y);
     float thr = P0.z;
@@ -763,7 +837,11 @@ static bool NeedScreenSample() {
     return !g_skyVValid;
 }
 
-static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
+// Draws a single cloud layer. lc holds that layer's appearance (scale/coverage/wind/etc.); t is its
+// already-computed animation time (see DrawAllCloudLayers for how layer 1 vs. 2/3 compute it).
+// Global rendering setup that isn't a per-layer aesthetic choice (sun direction, test mode, quad
+// depth, up axis, write-alpha, the coverage/threshold curve shape) stays shared across all layers.
+static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig& lc, float t) {
     if (!g_cfg.enabled || g_failed) return false;
     if (!g_haveCamView || !g_haveProj) return false;
     if (!EnsureResources(dev)) return false;
@@ -820,12 +898,15 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
     const float deg = 0.01745329252f;
     float az = g_cfg.sunAz * deg, el = g_cfg.sunEl * deg;
     float sunLen = 0.05f + 0.13f * (1.0f - sinf(el));
-    //float cov = g_cfg.coverage < 0 ? 0 : (g_cfg.coverage > 1 ? 1 : g_cfg.coverage);
+    //float cov = lc.coverage < 0 ? 0 : (lc.coverage > 1 ? 1 : lc.coverage);
 
     // -- Rain transition stuff start --
-    float covBase = g_cfg.coverage + (g_cfg.rainCoverage - g_cfg.coverage) * g_rainBlend + g_zoneCoverageAdd;
+    // The weather/zone shift (RainCoverage/RainOpacity delta, CoverageAdd) is computed once from
+    // layer 1's base values, then applied as the same absolute shift to every layer, so all layers
+    // thicken/clear together instead of each reacting to its own, very different, base coverage.
+    float covBase = lc.coverage + (g_cfg.rainCoverage - g_cfg.coverage) * g_rainBlend + g_zoneCoverageAdd;
     float cov = covBase < 0 ? 0 : (covBase > 1 ? 1 : covBase);
-    float opaBase = g_cfg.opacity + (g_cfg.rainOpacity - g_cfg.opacity) * g_rainBlend;
+    float opaBase = lc.opacity + (g_cfg.rainOpacity - g_cfg.opacity) * g_rainBlend;
     // -- Rain transition stuff end --
 
     // Clouds on clear days are slightly more transparent. The factor cancels itself out (returning to 1—i.e., 
@@ -840,19 +921,24 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
     // default, is lower than the actual noise minimum—ensuring there are no gaps of clear sky. 
     // Previously, the floor was fixed at 0.36, a level the fbm5 noise frequently reaches.
     float thr = 0.74f + (g_cfg.thrFloor - 0.74f) * powf(cov, 2.5f);
-    float t = (float)fmod(g_animTime, 36000.0);
     float lit[3], sh[3];
     ComputeColors(lit, sh);
-    float psc[36] = {
-        t, g_cfg.scale, thr, g_cfg.softness < 0.01f ? 0.01f : g_cfg.softness,
-        g_cfg.windX, g_cfg.windY, opaBase, g_cfg.horizonFade,
-        cosf(az) * sunLen, sinf(az) * sunLen, g_cfg.testMode ? 1.0f : 0.0f, g_cfg.dome,
+    // Arbitrary (decorrelating) multipliers -- not meant to mean anything, just spread NoiseSeed
+    // into a 2D offset far enough that different layers don't sample overlapping noise. NoiseSeed=0
+    // (layer 1's case) gives offset (0,0), i.e. the exact same noise field as before this feature.
+    float noiseOffX = lc.noiseSeed * 12.9898f;
+    float noiseOffY = lc.noiseSeed * 78.233f;
+    float psc[40] = {
+        t, lc.scale, thr, lc.softness < 0.01f ? 0.01f : lc.softness,
+        lc.windX, lc.windY, opaBase, lc.horizonFade,
+        cosf(az) * sunLen, sinf(az) * sunLen, g_cfg.testMode ? 1.0f : 0.0f, lc.dome,
         up[0], up[1], up[2], 0,
         e1[0], e1[1], e1[2], 0,
         e2[0], e2[1], e2[2], 0,
         lit[0], lit[1], lit[2], 1,
         sh[0], sh[1], sh[2], 1,
-        g_cfg.evolve, g_cfg.detail, g_cfg.bandSoft < 0.005f ? 0.005f : g_cfg.bandSoft, 0,
+        lc.evolve, lc.detail, lc.bandSoft < 0.005f ? 0.005f : lc.bandSoft, 0,
+        noiseOffX, noiseOffY, 0, 0,
     };
 
     // --- states ---
@@ -882,7 +968,7 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
     dev->SetVertexShader(g_vs);
     dev->SetPixelShader(g_ps);
     dev->SetVertexShaderConstantF(0, vsc, 4);
-    dev->SetPixelShaderConstantF(0, psc, 9);
+    dev->SetPixelShaderConstantF(0, psc, 10);
 
     static const float quad[8] = { -1, -1, -1, 1, 1, -1, 1, 1 };
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, 2 * sizeof(float));
@@ -897,6 +983,49 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky) {
             g_light0[0], g_light0[1], g_light0[2], lit[0], lit[1], lit[2], sh[0], sh[1], sh[2]);
     }
     return true;
+}
+
+// Builds a CloudLayerConfig from layer 1's legacy top-level [Clouds] fields, so DrawClouds can be
+// called the same way for all 3 layers. NoiseSeed=0 here on purpose: layer 1 must keep sampling
+// the exact same (unshifted) noise field it always has.
+static CloudLayerConfig Layer1Params() {
+    CloudLayerConfig lc;
+    lc.enabled = g_cfg.enabled;
+    lc.scale = g_cfg.scale;
+    lc.coverage = g_cfg.coverage;
+    lc.softness = g_cfg.softness;
+    lc.opacity = g_cfg.opacity;
+    lc.windX = g_cfg.windX;
+    lc.windY = g_cfg.windY;
+    lc.horizonFade = g_cfg.horizonFade;
+    lc.dome = g_cfg.dome;
+    lc.evolve = g_cfg.evolve;
+    lc.detail = g_cfg.detail;
+    lc.bandSoft = g_cfg.bandSoft;
+    lc.timeScale = g_cfg.timeScale;   // unused here (layer 1 uses g_animTime directly below), kept for clarity
+    lc.noiseSeed = 0.0f;
+    return lc;
+}
+
+// Draws every enabled cloud layer, farthest (layer 1) first and nearest (layer 3) last, so each
+// later layer paints over the ones before it where they overlap -- the same painter's-order trick
+// already used elsewhere in this file (see the sky-phase trigger notes near isSkyCol) to keep our
+// clouds correctly behind whatever is supposed to be in front of them.
+static bool DrawAllCloudLayers(IDirect3DDevice9* dev, bool atSky) {
+    bool any = false;
+
+    float t1 = (float)fmod(g_animTime, 36000.0);
+    if (DrawClouds(dev, atSky, Layer1Params(), t1)) any = true;
+
+    if (g_cfg.layer2.enabled) {
+        float t2 = (float)fmod(g_animTimeRaw * g_cfg.layer2.timeScale, 36000.0);
+        if (DrawClouds(dev, atSky, g_cfg.layer2, t2)) any = true;
+    }
+    if (g_cfg.layer3.enabled) {
+        float t3 = (float)fmod(g_animTimeRaw * g_cfg.layer3.timeScale, 36000.0);
+        if (DrawClouds(dev, atSky, g_cfg.layer3, t3)) any = true;
+    }
+    return any;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -979,7 +1108,7 @@ static void* CurRT(IDirect3DDevice9* d) {
 static void TryDraw(IDirect3DDevice9* d) {
     if (!g_worldDrawn || g_drawnThisFrame || !g_haveCamView || !g_haveProj) return;
     if (CurRT(d) != g_worldRT) return;
-    if (DrawClouds(d, false)) g_drawnThisFrame = true;
+    if (DrawAllCloudLayers(d, false)) g_drawnThisFrame = true;
 }
 
 static float RsF(DWORD v) { float f; memcpy(&f, &v, sizeof f); return f; }
@@ -1251,7 +1380,7 @@ static HRESULT STDMETHODCALLTYPE H_SetRenderTarget(IDirect3DDevice9* d, DWORD id
 static inline void PostDraw(IDirect3DDevice9* d) {
     if (!g_pendingSkyClouds) return;
     g_pendingSkyClouds = false;
-    if (!g_drawnThisFrame && DrawClouds(d, true)) g_drawnThisFrame = true;
+    if (!g_drawnThisFrame && DrawAllCloudLayers(d, true)) g_drawnThisFrame = true;
 }
 
 static HRESULT STDMETHODCALLTYPE H_DrawPrimitive(IDirect3DDevice9* d, D3DPRIMITIVETYPE pt, UINT sv, UINT pc) {
@@ -1526,6 +1655,8 @@ static HRESULT STDMETHODCALLTYPE H_Present(IDirect3DDevice9* d, const RECT* a, c
 
         // With the zoneSpeedMult for this frame already updated, the effective time is integrated.
         g_animTime += (double)dt * g_cfg.timeScale * g_zoneSpeedMult;
+        // Same integration, but without TimeScale baked in -- see g_animTimeRaw's declaration.
+        g_animTimeRaw += (double)dt * g_zoneSpeedMult;
 
         if (g_cfg.presetLog && (g_frame % 60) == 0) {
             const char* presetName = (idx >= 0) ? g_zonePresets[idx].name : "(none)";
