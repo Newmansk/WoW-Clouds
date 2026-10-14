@@ -24,6 +24,8 @@ You can add presets for any zone in the game using their id and add it to a pres
 
 ![Image](https://github.com/Newmansk/WoW-Clouds/blob/main/media/zoneBlending.gif) 
 
+![Image](https://github.com/Newmansk/WoW-Clouds/blob/main/media/burningSteppes.gif)
+
 ## Compatibility (Tested)
 
 | Component | Configuration |
