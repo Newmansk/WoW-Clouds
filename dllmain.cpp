@@ -41,6 +41,11 @@ struct CloudLayerConfig {
     // Offsets this layer's noise field so it doesn't look like an exact copy of the other layers
     // at a different scale. 0 = original/unshifted noise (this is what layer 1 always uses).
     float noiseSeed = 0.0f;
+    // Coverage/opacity this layer moves to while weather (rain/snow/dust) is active, replacing the
+    // global RainCoverage/RainOpacity for this layer only. Negative = not set: the layer then
+    // inherits the global weather shift (same absolute change as layer 1), as before this existed.
+    float rainCoverage = -1.0f;
+    float rainOpacity = -1.0f;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -55,6 +60,14 @@ struct Config {
     int   useFogTint = 0;       // sample the game's fog tone (the captured value is unreliable in this client)
     int   writeAlpha = 0;       // 1 = the clouds also write to the render target's alpha channel
     int   skyDump = 0;          // 1 = dumps the sky phase drawing calls into the log
+    // Set to 1, save the ini, do whatever in-game thing you want to capture (sheath/unsheath a
+    // weapon, etc.), and every sky-phase draw call for the next ~3 seconds gets dumped to the log
+    // -- unlike SkyDump above, which only fires on fixed, unpredictable frames. Resets itself back
+    // to 0 in the ini right after triggering, so it won't keep dumping on every later hot-reload.
+    int   dumpNow = 0;
+    // 1 = exposes Lua functions to in-game addons (see the Lua bridge section above H_Present).
+    // Off by default: it calls engine functions by address, so it's opt-in until verified.
+    int   luaBridge = 0;
     int   hideOrig = 0;         // 1 = It does not draw the calls listed in CloudDraws (original clouds)
     int   layer = 1;            // 1 = draw the clouds at the original position in the sky (always behind everything); 0 = at the end of the world with a depth test
     int   cloudPrims = 372;     // original cloud dome triangles (identifies the specific one even if the order changes)
@@ -148,6 +161,12 @@ struct Config {
     // the ini to enable and tweak them.
     CloudLayerConfig layer2;
     CloudLayerConfig layer3;
+
+    // 1.0 = full resolution (unchanged behavior). Below 1.0, all 3 layers are rendered into a
+    // smaller offscreen buffer (this fraction of the real target's width/height) and the result is
+    // stretched back onto the screen, to cut the GPU cost of the noise shader. Only applies to the
+    // normal sky-phase draw (Layer=1 path); the rare end-of-frame fallback always renders full-res.
+    float renderScale = 1.0f;
 };
 
 static Config g_cfg;
@@ -155,6 +174,17 @@ static HMODULE g_self;
 static char g_iniPath[MAX_PATH], g_logPath[MAX_PATH];
 static FILETIME g_iniTime;
 static DWORD g_lastIniCheck;
+
+static double NowSec() {
+    static LARGE_INTEGER f, t0;
+    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (double)(t.QuadPart - t0.QuadPart) / (double)f.QuadPart;
+}
+
+static bool   g_dumpWindowActive = false;   // DumpNow: a manual, on-demand dump window (see LoadConfig)
+static double g_dumpWindowUntil = 0.0;      // NowSec() timestamp at which that window closes
 
 // -- Weather: detected by the rate of change of the sky color (g_skyVColor) --
 enum { WX_UNKNOWN = -1, WX_CLEAR = 0, WX_RAIN = 1, WX_SNOW = 2, WX_SAND = 3 };
@@ -238,6 +268,8 @@ static void LoadExtraCloudLayer(const char* section, CloudLayerConfig& lc) {
     lc.bandSoft = ReadFSection(section, "BandSoftness", lc.bandSoft);
     lc.timeScale = ReadFSection(section, "TimeScale", lc.timeScale);
     lc.noiseSeed = ReadFSection(section, "NoiseSeed", lc.noiseSeed);
+    lc.rainCoverage = ReadFSection(section, "RainCoverage", lc.rainCoverage);
+    lc.rainOpacity = ReadFSection(section, "RainOpacity", lc.rainOpacity);
 }
 
 // -- Zone presets by AreaId --------------------------------------------------------------
@@ -349,6 +381,8 @@ static void ReadColor(const char* key, float out[3]) {
     if (sscanf(buf, "%f , %f , %f", &r, &g, &b) == 3) { out[0] = r; out[1] = g; out[2] = b; }
 }
 
+static void TunablesClearDirty();   // defined with the Lua bridge below
+
 static void LoadConfig() {
     Config c;  // default values
     c.enabled = (int)ReadF("Enabled", 1);
@@ -366,6 +400,8 @@ static void LoadConfig() {
     c.timeScale = ReadF("TimeScale", c.timeScale);
     c.minLit = ReadF("MinLit", c.minLit);
     c.skyDump = (int)ReadF("SkyDump", 0);
+    c.dumpNow = (int)ReadF("DumpNow", 0);
+    c.luaBridge = (int)ReadF("LuaBridge", 0);
     c.hideOrig = (int)ReadF("HideOriginalClouds", 0);
     c.colorSource = (int)ReadF("ColorSource", 5);
     c.colorTrace = (int)ReadF("ColorTrace", 0);
@@ -431,6 +467,8 @@ static void LoadConfig() {
     c.sunEl = ReadF("SunElevation", c.sunEl);
     c.quadDepth = ReadF("QuadDepth", c.quadDepth);
     c.nightBrightness = ReadF("NightBrightness", c.nightBrightness);
+    c.renderScale = ReadF("RenderScale", c.renderScale);
+    if (c.renderScale > 1.0f) c.renderScale = 1.0f;   // upscaling makes no sense here; clamp instead of silently ignoring a typo
     ReadColor("SunColor", c.sunColor);
     ReadColor("ShadowColor", c.shadowColor);
 
@@ -453,7 +491,20 @@ static void LoadConfig() {
     LoadExtraCloudLayer("CloudsLayer3", c.layer3);
 
     g_cfg = c;
+    TunablesClearDirty();   // the file is the source of truth again: in-game edits not saved are dropped
+    LogAlways("[config] loaded: Enabled=%d LuaBridge=%d Scale=%g (ini: %s)", c.enabled, c.luaBridge, c.scale, g_iniPath);
     LoadZonePresets();
+
+    if (c.dumpNow) {
+        g_dumpWindowActive = true;
+        g_dumpWindowUntil = NowSec() + 3.0;
+        LogAlways("[DumpNow] triggered: dumping every sky-phase draw call for the next ~3 seconds");
+        // Reset it in the file itself, so a later save/hot-reload doesn't re-trigger a dump the
+        // person forgot was still set to 1. Done before the mtime check right below, so this
+        // write doesn't cause an extra, pointless reload on the next poll.
+        WritePrivateProfileStringA("Clouds", "DumpNow", "0", g_iniPath);
+    }
+
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (GetFileAttributesExA(g_iniPath, GetFileExInfoStandard, &fad)) g_iniTime = fad.ftLastWriteTime;
 }
@@ -617,14 +668,6 @@ static float Smooth(float a, float b, float x) {
     return t * t * (3 - 2 * t);
 }
 
-static double NowSec() {
-    static LARGE_INTEGER f, t0;
-    if (!f.QuadPart) { QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0); }
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
-    return (double)(t.QuadPart - t0.QuadPart) / (double)f.QuadPart;
-}
-
 static void ReleaseDeviceResources() {
     if (g_sb) { g_sb->Release();   g_sb = NULL; }
     if (g_vs) { g_vs->Release();   g_vs = NULL; }
@@ -645,6 +688,13 @@ static bool  g_skyEnded;
 // Guards the sky-phase cloud trigger (see OnDraw) so it only fires once per frame, even
 // though the sky-gradient anchor call (isSkyCol) may be hit multiple times in a row.
 static bool  g_skyCloudsTriggeredThisFrame;
+// Sheathing/unsheathing a weapon makes the game issue a depth-writing draw (the weapon/model swap)
+// BEFORE the sky is drawn in that frame. The first depth-writing draw normally means "terrain
+// starts, sky phase over", so that frame's sky was classified as already finished and all its sky
+// draws were ignored (clouds not hidden, our clouds not triggered). These two track whether the
+// sky gradient has been seen yet, so early depth-writing draws can be tolerated (see OnDraw).
+static bool  g_skyGradSeen;
+static int   g_skyEarlyZ;
 static int   g_dbgDumpFrames;
 static bool  g_cloudColorValid;
 static float g_cloudColor[3];
@@ -664,6 +714,27 @@ static void ReleaseSampleBuffers() {
     if (g_smallRT) { g_smallRT->Release(); g_smallRT = NULL; }
     if (g_sysSurf) { g_sysSurf->Release(); g_sysSurf = NULL; }
     g_smallFmt = D3DFMT_UNKNOWN;
+}
+
+// ---- offscreen buffer for RenderScale < 1 (see DrawCloudLayersDownsampled) ----
+static IDirect3DSurface9* g_cloudRT;
+static UINT      g_cloudRTW, g_cloudRTH;
+static D3DFORMAT g_cloudRTFmt = D3DFMT_UNKNOWN;
+
+static void ReleaseCloudRT() {
+    if (g_cloudRT) { g_cloudRT->Release(); g_cloudRT = NULL; }
+    g_cloudRTW = g_cloudRTH = 0;
+    g_cloudRTFmt = D3DFMT_UNKNOWN;
+}
+
+// Creates (or recreates, if the size/format changed since last frame) the small offscreen buffer
+// the downsampled cloud path renders into.
+static bool EnsureCloudRT(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt) {
+    if (g_cloudRT && g_cloudRTW == w && g_cloudRTH == h && g_cloudRTFmt == fmt) return true;
+    ReleaseCloudRT();
+    if (FAILED(dev->CreateRenderTarget(w, h, fmt, D3DMULTISAMPLE_NONE, 0, FALSE, &g_cloudRT, NULL))) return false;
+    g_cloudRTW = w; g_cloudRTH = h; g_cloudRTFmt = fmt;
+    return true;
 }
 
 static void SampleSky(IDirect3DDevice9* dev, IDirect3DSurface9* rt, const D3DSURFACE_DESC& rd) {
@@ -841,12 +912,33 @@ static bool NeedScreenSample() {
 // already-computed animation time (see DrawAllCloudLayers for how layer 1 vs. 2/3 compute it).
 // Global rendering setup that isn't a per-layer aesthetic choice (sun direction, test mode, quad
 // depth, up axis, write-alpha, the coverage/threshold curve shape) stays shared across all layers.
-static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig& lc, float t) {
+// offscreenTarget is set by DrawCloudLayersDownsampled when the active render target is our own
+// smaller buffer rather than the real back buffer -- in that case the usual "must match the back
+// buffer's size" sanity check doesn't apply (that's the whole point of rendering smaller).
+// Captures the current device state into g_sb, for callers that already know g_sb exists (the
+// very first creation always happens inline in DrawClouds instead -- see manageState below -- so
+// that the first-ever draw of the mod's lifetime keeps exactly the timing/context that was already
+// tested and working; only later frames, once g_sb already exists, use this shared path).
+// This is the fixed per-call overhead the RenderScale test pointed at: temperature didn't change
+// between 0.1 and 1.0, which rules out the per-pixel shader cost and points at something that
+// happens the same number of times regardless of resolution, like a Capture()/Apply() pair.
+static void CaptureStateBlock() {
+    if (g_sb) g_sb->Capture();
+}
+
+// manageState: true (the default) makes this call create/capture state before drawing and restore
+// it after, exactly as before this optimization -- so any future standalone caller, and the very
+// first draw of the mod's lifetime (when g_sb doesn't exist yet), keep working unchanged. The
+// 3-layer callers (DrawAllCloudLayers / DrawCloudLayersDownsampled), once g_sb already exists from
+// an earlier frame, instead capture once themselves (CaptureStateBlock) and pass false here for
+// every layer, restoring once after the last one.
+static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig& lc, float t, bool offscreenTarget = false, bool manageState = true) {
     if (!g_cfg.enabled || g_failed) return false;
     if (!g_haveCamView || !g_haveProj) return false;
     if (!EnsureResources(dev)) return false;
 
-    // We only draw if the current render target has the same size as the back buffer and a depth buffer exists.
+    // Normally we only draw if the current render target has the same size as the back buffer and a
+    // depth buffer exists. When offscreenTarget is true, the size check is skipped on purpose.
     IDirect3DSurface9* rt = NULL, * bb = NULL, * zs = NULL;
     D3DSURFACE_DESC rd, bd;
     memset(&rd, 0, sizeof rd);
@@ -857,7 +949,8 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig
     if (gotBB) bb->GetDesc(&bd);
     HRESULT zr = dev->GetDepthStencilSurface(&zs);
     bool isBB = (rt == bb);
-    bool ok = gotRT && gotBB && rd.Width == bd.Width && rd.Height == bd.Height && SUCCEEDED(zr) && zs;
+    bool ok = gotRT && SUCCEEDED(zr) && zs &&
+        (offscreenTarget || (gotBB && rd.Width == bd.Width && rd.Height == bd.Height));
     if (ok && !atSky && NeedScreenSample()) SampleSky(dev, rt, rd);
     if (rt) rt->Release();
     if (bb) bb->Release();
@@ -871,10 +964,17 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig
         return false;
     }
 
+    // The very first creation of g_sb always happens right here, exactly as before this
+    // optimization existed -- this keeps that one-time, first-frame-of-the-mod's-life code path
+    // byte-for-byte the same as what was already tested and working. Only once g_sb already exists
+    // does manageState start to matter: true captures again here (the old per-layer behavior,
+    // still used for layer 1's very first call and for any future standalone caller); false skips
+    // it because the caller (DrawAllCloudLayers / DrawCloudLayersDownsampled) already captured once
+    // for every layer in this pass via CaptureStateBlock().
     if (!g_sb) {
         if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &g_sb))) { g_sb = NULL; LogAlways("CreateStateBlock failed"); g_failed = true; return false; }
     }
-    else {
+    else if (manageState) {
         g_sb->Capture();
     }
 
@@ -901,12 +1001,15 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig
     //float cov = lc.coverage < 0 ? 0 : (lc.coverage > 1 ? 1 : lc.coverage);
 
     // -- Rain transition stuff start --
-    // The weather/zone shift (RainCoverage/RainOpacity delta, CoverageAdd) is computed once from
-    // layer 1's base values, then applied as the same absolute shift to every layer, so all layers
-    // thicken/clear together instead of each reacting to its own, very different, base coverage.
-    float covBase = lc.coverage + (g_cfg.rainCoverage - g_cfg.coverage) * g_rainBlend + g_zoneCoverageAdd;
+    // Where this layer's coverage/opacity go while weather is active. A layer with its own
+    // RainCoverage/RainOpacity (>= 0) goes straight to that value. Otherwise it inherits the global
+    // weather shift, applied as the same absolute change layer 1 gets (global RainX minus layer 1's
+    // base), so layers without their own setting still thicken/clear together.
+    float rainCovTarget = (lc.rainCoverage >= 0.0f) ? lc.rainCoverage : lc.coverage + (g_cfg.rainCoverage - g_cfg.coverage);
+    float rainOpaTarget = (lc.rainOpacity >= 0.0f) ? lc.rainOpacity : lc.opacity + (g_cfg.rainOpacity - g_cfg.opacity);
+    float covBase = lc.coverage + (rainCovTarget - lc.coverage) * g_rainBlend + g_zoneCoverageAdd;
     float cov = covBase < 0 ? 0 : (covBase > 1 ? 1 : covBase);
-    float opaBase = lc.opacity + (g_cfg.rainOpacity - g_cfg.opacity) * g_rainBlend;
+    float opaBase = lc.opacity + (rainOpaTarget - lc.opacity) * g_rainBlend;
     // -- Rain transition stuff end --
 
     // Clouds on clear days are slightly more transparent. The factor cancels itself out (returning to 1—i.e., 
@@ -973,7 +1076,7 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig
     static const float quad[8] = { -1, -1, -1, 1, 1, -1, 1, 1 };
     dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, 2 * sizeof(float));
 
-    g_sb->Apply();
+    if (manageState) g_sb->Apply();
     g_inDraw = false;
 
     if (g_dbgDrawLogs < 20) {
@@ -982,6 +1085,13 @@ static bool DrawClouds(IDirect3DDevice9* dev, bool atSky, const CloudLayerConfig
             g_frame, atSky ? "sky layer" : "end of the world", (unsigned)rd.Width, (unsigned)rd.Height, (int)isBB, g_fogLast, g_ambient,
             g_light0[0], g_light0[1], g_light0[2], lit[0], lit[1], lit[2], sh[0], sh[1], sh[2]);
     }
+    // Uncapped (unlike the log right above, which stops after 20 total): compares the color used on
+    // the "end of the world" fallback frames against the normal sky-layer frames around them, to see
+    // whether the fallback is drawing with stale/jumped color -- the current suspect for the
+    // sheath/unsheath flicker, now that we've confirmed (via TryDraw's own log) that the fallback
+    // always succeeds in actually drawing something on the zero-sky-calls frames.
+    LogDbg("[colorcheck frame %lu] (%s) colorValid=%d lit=(%.3f %.3f %.3f) shadow=(%.3f %.3f %.3f)",
+        g_frame, atSky ? "sky" : "fallback", (int)g_cloudColorValid, lit[0], lit[1], lit[2], sh[0], sh[1], sh[2]);
     return true;
 }
 
@@ -1004,7 +1114,53 @@ static CloudLayerConfig Layer1Params() {
     lc.bandSoft = g_cfg.bandSoft;
     lc.timeScale = g_cfg.timeScale;   // unused here (layer 1 uses g_animTime directly below), kept for clarity
     lc.noiseSeed = 0.0f;
+    lc.rainCoverage = g_cfg.rainCoverage;   // layer 1's weather targets are the global ones
+    lc.rainOpacity = g_cfg.rainOpacity;
     return lc;
+}
+
+// RenderScale < 1 path: copies the current (pre-cloud) render target content down into a smaller
+// offscreen buffer, draws all 3 layers into that buffer (so the noise shader runs on far fewer
+// pixels), then stretches the result back onto the real target. This is what actually cuts GPU
+// load -- unlike the per-draw-call state-block overhead, which is unrelated to resolution.
+// Only used for the sky-phase draw (atSky==true), where ZENABLE=FALSE means there's no depth
+// buffer to keep matched to a smaller target; the caller never requests this for atSky==false.
+// Side effect worth knowing: the down+up round trip slightly blurs the WHOLE sky area it covers
+// (not just the cloud shapes themselves), since the background gets downsampled along with them.
+static bool DrawCloudLayersDownsampled(IDirect3DDevice9* dev, float t1, float t2, float t3) {
+    IDirect3DSurface9* rt = NULL;
+    if (FAILED(dev->GetRenderTarget(0, &rt)) || !rt) return false;
+    D3DSURFACE_DESC rd;
+    rt->GetDesc(&rd);
+    if (rd.MultiSampleType != D3DMULTISAMPLE_NONE) { rt->Release(); return false; }   // StretchRect between MSAA and non-MSAA surfaces isn't reliable; skip downsampling this frame, draw full-res instead (see caller)
+
+    UINT w = (UINT)(rd.Width * g_cfg.renderScale);
+    UINT h = (UINT)(rd.Height * g_cfg.renderScale);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    if (!EnsureCloudRT(dev, w, h, rd.Format)) { rt->Release(); return false; }
+
+    // Copy the not-yet-cloud background down, so the layers' alpha blend composites against the
+    // real sky color instead of whatever was left in the buffer from a previous frame.
+    if (FAILED(dev->StretchRect(rt, NULL, g_cloudRT, NULL, D3DTEXF_LINEAR))) { rt->Release(); return false; }
+    if (FAILED(dev->SetRenderTarget(0, g_cloudRT))) { rt->Release(); return false; }
+
+    // See the comment on CaptureStateBlock/manageState above DrawClouds: if g_sb doesn't exist yet,
+    // leave its first creation (and implicit initial capture) to layer 1's own DrawClouds call below.
+    CaptureStateBlock();
+
+    bool any = false;
+    if (DrawClouds(dev, true, Layer1Params(), t1, true, false)) any = true;
+    if (g_cfg.layer2.enabled && DrawClouds(dev, true, g_cfg.layer2, t2, true, false)) any = true;
+    if (g_cfg.layer3.enabled && DrawClouds(dev, true, g_cfg.layer3, t3, true, false)) any = true;
+    if (g_sb) g_sb->Apply();
+
+    dev->SetRenderTarget(0, rt);   // also resets the viewport back to the real target's full size
+    if (any) dev->StretchRect(g_cloudRT, NULL, rt, NULL, D3DTEXF_LINEAR);
+
+    rt->Release();
+    return any;
 }
 
 // Draws every enabled cloud layer, farthest (layer 1) first and nearest (layer 3) last, so each
@@ -1012,19 +1168,30 @@ static CloudLayerConfig Layer1Params() {
 // already used elsewhere in this file (see the sky-phase trigger notes near isSkyCol) to keep our
 // clouds correctly behind whatever is supposed to be in front of them.
 static bool DrawAllCloudLayers(IDirect3DDevice9* dev, bool atSky) {
-    bool any = false;
-
     float t1 = (float)fmod(g_animTime, 36000.0);
-    if (DrawClouds(dev, atSky, Layer1Params(), t1)) any = true;
+    float t2 = (float)fmod(g_animTimeRaw * g_cfg.layer2.timeScale, 36000.0);
+    float t3 = (float)fmod(g_animTimeRaw * g_cfg.layer3.timeScale, 36000.0);
 
-    if (g_cfg.layer2.enabled) {
-        float t2 = (float)fmod(g_animTimeRaw * g_cfg.layer2.timeScale, 36000.0);
-        if (DrawClouds(dev, atSky, g_cfg.layer2, t2)) any = true;
+    if (atSky && g_cfg.renderScale < 0.999f && g_cfg.renderScale > 0.0f) {
+        if (DrawCloudLayersDownsampled(dev, t1, t2, t3)) return true;
+        // If the downsample path bailed out for some reason (MSAA target, surface creation
+        // failure, etc.), fall through and draw full-res instead of silently losing the clouds.
     }
-    if (g_cfg.layer3.enabled) {
-        float t3 = (float)fmod(g_animTimeRaw * g_cfg.layer3.timeScale, 36000.0);
-        if (DrawClouds(dev, atSky, g_cfg.layer3, t3)) any = true;
-    }
+
+    // One Capture()/Apply() for however many of the 3 layers actually draw this frame, instead of
+    // one pair per layer (see CaptureStateBlock for why this is the change that should actually
+    // move the needle on GPU temperature/CPU overhead, unlike RenderScale). If g_sb doesn't exist
+    // yet (the very first draw of the mod's lifetime), leave its creation to layer 1's own
+    // DrawClouds call below, at the exact point it has always happened.
+    if (!g_cfg.enabled || g_failed) return false;
+    CaptureStateBlock();
+
+    bool any = false;
+    if (DrawClouds(dev, atSky, Layer1Params(), t1, false, false)) any = true;
+    if (g_cfg.layer2.enabled && DrawClouds(dev, atSky, g_cfg.layer2, t2, false, false)) any = true;
+    if (g_cfg.layer3.enabled && DrawClouds(dev, atSky, g_cfg.layer3, t3, false, false)) any = true;
+
+    if (g_sb) g_sb->Apply();
     return any;
 }
 
@@ -1106,9 +1273,27 @@ static void* CurRT(IDirect3DDevice9* d) {
 
 // Draw the clouds if the world has already been drawn in perspective and the current render target is the world's.
 static void TryDraw(IDirect3DDevice9* d) {
+    // Diagnostic for the "zero sky-phase calls" frames found via DumpNow: shows whether this
+    // end-of-frame fallback actually fires on those frames, and if not, which check stopped it.
+    LogDbg("[frame %lu] TryDraw called: worldDrawn=%d drawnThisFrame=%d haveCamView=%d haveProj=%d rtMatch=%d",
+        g_frame, (int)g_worldDrawn, (int)g_drawnThisFrame, (int)g_haveCamView, (int)g_haveProj, (int)(CurRT(d) == g_worldRT));
     if (!g_worldDrawn || g_drawnThisFrame || !g_haveCamView || !g_haveProj) return;
     if (CurRT(d) != g_worldRT) return;
-    if (DrawAllCloudLayers(d, false)) g_drawnThisFrame = true;
+    // This fallback paints our clouds with depth testing at the END of the world pass. If it fires
+    // while the sky phase is still open (e.g. a model draw before the sky set g_worldDrawn, then the
+    // game switched render targets), it would paint the clouds BEFORE the sky is drawn, the sky then
+    // covers them, and the sky-phase injection is skipped for the frame because g_drawnThisFrame is
+    // already set -- i.e. the clouds vanish for a frame and the stars show through.
+    if (!g_skyEnded) {
+        if (g_dumpWindowActive && NowSec() < g_dumpWindowUntil)
+            LogAlways("[trydraw f%lu] skipped: sky phase not finished yet (gradSeen=%d earlyZ=%d)", g_frame, (int)g_skyGradSeen, g_skyEarlyZ);
+        return;
+    }
+    if (g_dumpWindowActive && NowSec() < g_dumpWindowUntil)
+        LogAlways("[trydraw f%lu] fallback drawing clouds (skyEnded=1)", g_frame);
+    bool drew = DrawAllCloudLayers(d, false);
+    LogDbg("[frame %lu] TryDraw fallback drew clouds = %d", g_frame, (int)drew);
+    if (drew) g_drawnThisFrame = true;
 }
 
 static float RsF(DWORD v) { float f; memcpy(&f, &v, sizeof f); return f; }
@@ -1204,15 +1389,33 @@ static bool ReadVertexColor(const DrawInfo& di, float rgb[3], float* alpha) {
 
 // It is called before each draw call. It returns true if the call should be skipped (original clouds hidden).
 static bool OnDraw(IDirect3DDevice9* d, const DrawInfo& di) {
-    if (g_inDraw || !g_persp) return false;
+    if (g_inDraw) return false;
+    // Diagnostic (DumpNow window only): every sky-gradient / cloud-dome sized draw, with the state
+    // flags OnDraw uses to decide whether to look at it. The "0 calls" frames show NO sky draws
+    // before the world starts, so this tells us where in the frame they actually happen.
+    if (g_dumpWindowActive && NowSec() < g_dumpWindowUntil &&
+        (di.prims == (UINT)g_cfg.skyColorPrims || di.prims == (UINT)g_cfg.cloudPrims))
+        LogAlways("[skydraw f%lu] %s prims=%u tex=%s persp=%d skyEnded=%d zwrite=%lu",
+            g_frame, di.kind, (unsigned)di.prims, g_tex0 ? "yes" : "no", (int)g_persp, (int)g_skyEnded,
+            (unsigned long)g_rs[D3DRS_ZWRITEENABLE]);
+    if (!g_persp) return false;
     g_worldRT = CurRT(d);
     g_worldDrawn = true;
     g_worldDraws++;
     g_worldPrims += di.prims;
     if (g_skyEnded) return false;
 
-    bool dumping = g_cfg.skyDump && g_dbgDumpFrames < 6 && (g_frame % 600 == 300 || g_frame % 600 == 301);
+    if (g_dumpWindowActive && NowSec() >= g_dumpWindowUntil) g_dumpWindowActive = false;   // window elapsed
+    bool dumping = (g_cfg.skyDump && g_dbgDumpFrames < 6 && (g_frame % 600 == 300 || g_frame % 600 == 301)) || g_dumpWindowActive;
     if (g_rs[D3DRS_ZWRITEENABLE]) {   // First draw call that writes depth = terrain/objects begin.
+        // ...unless the sky gradient hasn't been drawn yet this frame: then it's an early model draw
+        // (weapon swap), not the start of the terrain, so keep the sky phase open. Bounded, so a
+        // frame that has no gradient at all still ends its sky phase after a few draws.
+        if (!g_skyGradSeen && g_skyEarlyZ < 64) {
+            g_skyEarlyZ++;
+            if (dumping && g_skyEarlyZ == 1) LogAlways("[sky f%lu] depth-writing draw before the sky gradient: sky phase kept open", g_frame);
+            return false;
+        }
         g_skyEnded = true;
         if (g_cfg.colorTrace && (g_frame % 72) == 0) LogWeather("terrain-start");
         if (dumping) LogAlways("[sky f%lu] end of sky phase after %d calls", g_frame, g_skyOrd);
@@ -1227,6 +1430,7 @@ static bool OnDraw(IDirect3DDevice9* d, const DrawInfo& di) {
     bool haveVC = false;
     bool wantColor = isCloud && g_cfg.colorSource == 2 && (!g_cloudColorValid || (g_frame % (DWORD)g_cfg.skySampleEvery) == 0);
     bool isSkyCol = g_cfg.skyColorPrims > 0 ? (di.prims == (UINT)g_cfg.skyColorPrims && g_tex0 == NULL) : (ord == g_cfg.skyColorDraw);
+    if (isSkyCol) g_skyGradSeen = true;
     bool wantSky = isSkyCol && g_cfg.colorSource == 5 && (!g_skyVValid || (g_frame % (DWORD)g_cfg.skySampleEvery) == 0);
     bool traceNow = g_cfg.colorTrace && ord < 8 && (g_frame % 72) == 0;
     if (dumping || wantColor || wantSky || traceNow) haveVC = ReadVertexColor(di, vc, &va);
@@ -1318,6 +1522,8 @@ static HRESULT STDMETHODCALLTYPE H_SetTransform(IDirect3DDevice9* d, D3DTRANSFOR
             LogDbg("[frame %lu] SetTransform(PROJECTION) %s  _11=%g _22=%g _33=%g _34=%g _43=%g _44=%g  worldDrawn=%d drawn=%d",
                 g_frame, persp ? "PERSP" : "ORTHO", m->_11, m->_22, m->_33, m->_34, m->_43, m->_44, (int)g_worldDrawn, (int)g_drawnThisFrame);
         }
+        if (g_dumpWindowActive && NowSec() < g_dumpWindowUntil)
+            LogAlways("[proj f%lu] SetTransform(PROJECTION) %s (g_persp was %d, worldDrawn=%d)", g_frame, persp ? "PERSP" : "ORTHO", (int)g_persp, (int)g_worldDrawn);
         if (persp) {
             g_proj = *m; g_haveProj = true; g_persp = true;
         }
@@ -1380,6 +1586,8 @@ static HRESULT STDMETHODCALLTYPE H_SetRenderTarget(IDirect3DDevice9* d, DWORD id
 static inline void PostDraw(IDirect3DDevice9* d) {
     if (!g_pendingSkyClouds) return;
     g_pendingSkyClouds = false;
+    if (g_dumpWindowActive && NowSec() < g_dumpWindowUntil)
+        LogAlways("[postdraw f%lu] sky-phase clouds (alreadyDrawn=%d skyOrd=%d)", g_frame, (int)g_drawnThisFrame, g_skyOrd);
     if (!g_drawnThisFrame && DrawAllCloudLayers(d, true)) g_drawnThisFrame = true;
 }
 
@@ -1555,10 +1763,253 @@ static void UpdatePulseWeather() {
     // g_wxPulseHeld remains held.
 }
 
+// ---------------------------------------------------------------------------------------------
+// Lua bridge: lets in-game addons read and change this DLL's settings in real time.
+// Engine addresses come from ClassicAPI's Offsets.h (GPL-3.0), stock 1.12.1 client layout.
+// The engine's lua_* API is __fastcall (L in ECX). Registration needs no code hook: WoW's Lua
+// functions are plain globals, so once the engine's Lua state exists we register ours from the
+// Present hook (game thread, outside any Lua call).
+//
+// Lua-side API (all numbers/strings, no tables, to keep the engine calls minimal):
+//   WowCloudsPing()                -> 12345 (connectivity test)
+//   WowCloudsCount()               -> number of tunable variables
+//   WowCloudsInfo(i)               -> name, group, min, max, step, value   (i is 1-based; nil if out of range)
+//   WowCloudsGet(name)             -> value, or nil
+//   WowCloudsSet(name, value)      -> true/false; clamps to [min,max]; applies immediately, not saved
+//   WowCloudsSave()                -> writes the variables changed since the last load/save to the ini, returns how many
+//   WowCloudsReload()              -> drops unsaved changes by re-reading the ini, returns true
+// ---------------------------------------------------------------------------------------------
+static const DWORD LUA_ADDR_REGISTER_FUNCTION = 0x00704120;   // FrameScript_RegisterFunction, __fastcall(name, func)
+static const DWORD LUA_ADDR_STATE_VAR = 0x00CEEF74;           // pointer to the active lua_State (glue state at login, world state in-game)
+static const DWORD LUA_ADDR_GET_TOP = 0x006F3070;
+static const DWORD LUA_ADDR_IS_NUMBER = 0x006F34D0;
+static const DWORD LUA_ADDR_IS_STRING = 0x006F3510;
+static const DWORD LUA_ADDR_TO_NUMBER = 0x006F3620;
+static const DWORD LUA_ADDR_TO_STRING = 0x006F3690;
+static const DWORD LUA_ADDR_PUSH_NIL = 0x006F37F0;
+static const DWORD LUA_ADDR_PUSH_NUMBER = 0x006F3810;
+static const DWORD LUA_ADDR_PUSH_STRING = 0x006F3890;
+static const DWORD LUA_ADDR_PUSH_BOOLEAN = 0x006F39F0;
+
+typedef int(__fastcall* LuaCFunction_t)(void* L);
+typedef void(__fastcall* FrameScriptRegisterFunction_t)(const char* name, LuaCFunction_t func);
+
+// Engine address -> this process's address (WoW.exe is linked at 0x400000).
+static DWORD GameAddr(DWORD a) { return (DWORD)GetModuleHandleA(NULL) + (a - 0x400000); }
+
+static inline int    LuaIsNumber(void* L, int idx) { return ((int(__fastcall*)(void*, int))GameAddr(LUA_ADDR_IS_NUMBER))(L, idx); }
+static inline int    LuaIsString(void* L, int idx) { return ((int(__fastcall*)(void*, int))GameAddr(LUA_ADDR_IS_STRING))(L, idx); }
+static inline double LuaToNumber(void* L, int idx) { return ((double(__fastcall*)(void*, int))GameAddr(LUA_ADDR_TO_NUMBER))(L, idx); }
+static inline const char* LuaToString(void* L, int idx) { return ((const char* (__fastcall*)(void*, int))GameAddr(LUA_ADDR_TO_STRING))(L, idx); }
+static inline void   LuaPushNil(void* L) { ((void(__fastcall*)(void*))GameAddr(LUA_ADDR_PUSH_NIL))(L); }
+static inline void   LuaPushNumber(void* L, double n) { ((void(__fastcall*)(void*, double))GameAddr(LUA_ADDR_PUSH_NUMBER))(L, n); }
+static inline void   LuaPushString(void* L, const char* str) { ((void(__fastcall*)(void*, const char*))GameAddr(LUA_ADDR_PUSH_STRING))(L, str); }
+static inline void   LuaPushBoolean(void* L, int b) { ((void(__fastcall*)(void*, int))GameAddr(LUA_ADDR_PUSH_BOOLEAN))(L, b); }
+
+// ---- Tunable variables: what the in-game window can edit. ----
+// Each entry points straight at a field of g_cfg (or one of its extra layers), so a change applies
+// on the very next frame. `dirty` marks values changed in-game and not yet written to the ini.
+// Ranges/steps are only hints for the UI sliders; Set clamps to [lo,hi].
+struct TunableVar {
+    const char* name;    // public name used by Lua
+    const char* group;   // UI tab
+    const char* sec;     // ini section, for Save
+    const char* key;     // ini key, for Save
+    float* f;            // exactly one of f / i is non-null
+    int* i;
+    float lo, hi, step;
+    bool dirty;
+};
+#define TV_F(n, g, s, k, fld, lo, hi, st) { n, g, s, k, &g_cfg.fld, NULL, lo, hi, st, false }
+#define TV_I(n, g, s, k, fld)             { n, g, s, k, NULL, &g_cfg.fld, 0.0f, 1.0f, 1.0f, false }
+// The same appearance keys exist for each extra layer (section CloudsLayerN, names prefixed "LN.").
+#define TV_LAYER(P, G, S, L) \
+    TV_I(P "Enabled", G, S, "Enabled", L.enabled), \
+    TV_F(P "Scale", G, S, "Scale", L.scale, 0.2f, 8.0f, 0.05f), \
+    TV_F(P "Coverage", G, S, "Coverage", L.coverage, 0.0f, 1.0f, 0.01f), \
+    TV_F(P "Opacity", G, S, "Opacity", L.opacity, 0.0f, 2.0f, 0.05f), \
+    TV_F(P "Softness", G, S, "Softness", L.softness, 0.01f, 0.5f, 0.01f), \
+    TV_F(P "HorizonFade", G, S, "HorizonFade", L.horizonFade, 0.0f, 1.0f, 0.01f), \
+    TV_F(P "Dome", G, S, "Dome", L.dome, 0.0f, 1.0f, 0.01f), \
+    TV_F(P "WindX", G, S, "WindX", L.windX, -0.3f, 0.3f, 0.005f), \
+    TV_F(P "WindY", G, S, "WindY", L.windY, -0.3f, 0.3f, 0.005f), \
+    TV_F(P "TimeScale", G, S, "TimeScale", L.timeScale, 0.0f, 2.0f, 0.01f), \
+    TV_F(P "Evolve", G, S, "Evolve", L.evolve, 0.0f, 1.0f, 0.01f), \
+    TV_F(P "Detail", G, S, "Detail", L.detail, 0.0f, 3.0f, 0.1f), \
+    TV_F(P "BandSoftness", G, S, "BandSoftness", L.bandSoft, 0.005f, 0.3f, 0.005f), \
+    TV_F(P "RainCoverage", G, S, "RainCoverage", L.rainCoverage, -1.0f, 1.0f, 0.01f), /* -1 = inherit the global weather shift */ \
+    TV_F(P "RainOpacity", G, S, "RainOpacity", L.rainOpacity, -1.0f, 2.0f, 0.05f)     /* -1 = inherit */
+
+static TunableVar g_vars[] = {
+    // Layer 1 (the [Clouds] keys)
+    TV_F("Scale", "Layer1", "Clouds", "Scale", scale, 0.2f, 8.0f, 0.05f),
+    TV_F("Coverage", "Layer1", "Clouds", "Coverage", coverage, 0.0f, 1.0f, 0.01f),
+    TV_F("Opacity", "Layer1", "Clouds", "Opacity", opacity, 0.0f, 2.0f, 0.05f),
+    TV_F("Softness", "Layer1", "Clouds", "Softness", softness, 0.01f, 0.5f, 0.01f),
+    TV_F("HorizonFade", "Layer1", "Clouds", "HorizonFade", horizonFade, 0.0f, 1.0f, 0.01f),
+    TV_F("Dome", "Layer1", "Clouds", "Dome", dome, 0.0f, 1.0f, 0.01f),
+    TV_F("WindX", "Layer1", "Clouds", "WindX", windX, -0.3f, 0.3f, 0.005f),
+    TV_F("WindY", "Layer1", "Clouds", "WindY", windY, -0.3f, 0.3f, 0.005f),
+    TV_F("TimeScale", "Layer1", "Clouds", "TimeScale", timeScale, 0.0f, 2.0f, 0.01f),
+    TV_F("Evolve", "Layer1", "Clouds", "Evolve", evolve, 0.0f, 1.0f, 0.01f),
+    TV_F("Detail", "Layer1", "Clouds", "Detail", detail, 0.0f, 3.0f, 0.1f),
+    TV_F("BandSoftness", "Layer1", "Clouds", "BandSoftness", bandSoft, 0.005f, 0.3f, 0.005f),
+    // Extra layers
+    TV_LAYER("L2.", "Layer2", "CloudsLayer2", layer2),
+    TV_LAYER("L3.", "Layer3", "CloudsLayer3", layer3),
+    // Light and color
+    TV_F("SunAzimuth", "Light", "Clouds", "SunAzimuth", sunAz, 0.0f, 360.0f, 1.0f),
+    TV_F("SunElevation", "Light", "Clouds", "SunElevation", sunEl, 0.0f, 90.0f, 1.0f),
+    TV_F("NightBrightness", "Light", "Clouds", "NightBrightness", nightBrightness, 0.0f, 1.0f, 0.01f),
+    TV_F("TintMix", "Light", "Clouds", "TintMix", tintMix, 0.0f, 2.0f, 0.05f),
+    TV_F("ColorGain", "Light", "Clouds", "ColorGain", colorGain, 0.0f, 3.0f, 0.05f),
+    TV_F("MinLit", "Light", "Clouds", "MinLit", minLit, 0.0f, 0.5f, 0.01f),
+    // Weather
+    TV_F("RainCoverage", "Weather", "Clouds", "RainCoverage", rainCoverage, 0.0f, 1.0f, 0.01f),
+    TV_F("RainOpacity", "Weather", "Clouds", "RainOpacity", rainOpacity, 0.0f, 2.0f, 0.05f),
+    TV_F("RainDarken", "Weather", "Clouds", "RainDarken", rainDarken, 0.0f, 1.0f, 0.01f),
+    TV_F("RainBlendSpeed", "Weather", "Clouds", "RainBlendSpeed", rainBlendSpeed, 0.01f, 1.0f, 0.01f),
+    TV_I("DayTransparencyEnabled", "Weather", "Clouds", "DayTransparencyEnabled", dayTransparencyEnabled),
+    TV_F("DayTransparencyAmount", "Weather", "Clouds", "DayTransparencyAmount", dayTransparencyAmount, 0.0f, 1.0f, 0.01f),
+    // Global
+    TV_I("Enabled", "Global", "Clouds", "Enabled", enabled),
+    TV_I("HideOriginalClouds", "Global", "Clouds", "HideOriginalClouds", hideOrig),
+    TV_F("RenderScale", "Global", "Clouds", "RenderScale", renderScale, 0.25f, 1.0f, 0.05f),
+};
+static const int g_varCount = (int)(sizeof(g_vars) / sizeof(g_vars[0]));
+
+static float TvGet(const TunableVar& v) { return v.f ? *v.f : (float)*v.i; }
+static void TvSet(TunableVar& v, float x) {
+    if (x < v.lo) x = v.lo;
+    if (x > v.hi) x = v.hi;
+    if (v.f) *v.f = x; else *v.i = (int)(x + (x >= 0.0f ? 0.5f : -0.5f));
+    v.dirty = true;
+}
+static TunableVar* TvFind(const char* name) {
+    if (!name) return NULL;
+    for (int k = 0; k < g_varCount; k++) if (_stricmp(g_vars[k].name, name) == 0) return &g_vars[k];
+    return NULL;
+}
+static void TunablesClearDirty() { for (int k = 0; k < g_varCount; k++) g_vars[k].dirty = false; }
+
+// ---- Lua-callable functions (engine ABI: int __fastcall(lua_State*); returns how many values it pushed) ----
+static int __fastcall Script_WowCloudsPing(void* L) { LuaPushNumber(L, 12345.0); return 1; }
+
+static int __fastcall Script_WowCloudsCount(void* L) { LuaPushNumber(L, (double)g_varCount); return 1; }
+
+static int __fastcall Script_WowCloudsInfo(void* L) {
+    if (!LuaIsNumber(L, 1)) { LuaPushNil(L); return 1; }
+    int idx = (int)LuaToNumber(L, 1) - 1;
+    if (idx < 0 || idx >= g_varCount) { LuaPushNil(L); return 1; }
+    const TunableVar& v = g_vars[idx];
+    LuaPushString(L, v.name);
+    LuaPushString(L, v.group);
+    LuaPushNumber(L, v.lo);
+    LuaPushNumber(L, v.hi);
+    LuaPushNumber(L, v.step);
+    LuaPushNumber(L, TvGet(v));
+    return 6;
+}
+
+static int __fastcall Script_WowCloudsGet(void* L) {
+    TunableVar* v = LuaIsString(L, 1) ? TvFind(LuaToString(L, 1)) : NULL;
+    if (!v) { LuaPushNil(L); return 1; }
+    LuaPushNumber(L, TvGet(*v));
+    return 1;
+}
+
+static int __fastcall Script_WowCloudsSet(void* L) {
+    TunableVar* v = (LuaIsString(L, 1) && LuaIsNumber(L, 2)) ? TvFind(LuaToString(L, 1)) : NULL;
+    if (!v) { LuaPushBoolean(L, 0); return 1; }
+    TvSet(*v, (float)LuaToNumber(L, 2));
+    LuaPushBoolean(L, 1);
+    return 1;
+}
+
+static int __fastcall Script_WowCloudsSave(void* L) {
+    int written = 0;
+    for (int k = 0; k < g_varCount; k++) {
+        TunableVar& v = g_vars[k];
+        if (!v.dirty) continue;
+        char buf[32];
+        snprintf(buf, sizeof buf, "%g", TvGet(v));
+        WritePrivateProfileStringA(v.sec, v.key, buf, g_iniPath);
+        v.dirty = false;
+        written++;
+    }
+    if (written) {
+        // The values in memory already match what we just wrote, so skip the hot reload it would trigger.
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExA(g_iniPath, GetFileExInfoStandard, &fad)) g_iniTime = fad.ftLastWriteTime;
+    }
+    LuaPushNumber(L, (double)written);
+    return 1;
+}
+
+static int __fastcall Script_WowCloudsReload(void* L) {
+    LoadConfig();
+    LuaPushBoolean(L, 1);
+    return 1;
+}
+
+struct LuaExport { const char* name; LuaCFunction_t fn; };
+static const LuaExport g_luaExports[] = {
+    { "WowCloudsPing", Script_WowCloudsPing },
+    { "WowCloudsCount", Script_WowCloudsCount },
+    { "WowCloudsInfo", Script_WowCloudsInfo },
+    { "WowCloudsGet", Script_WowCloudsGet },
+    { "WowCloudsSet", Script_WowCloudsSet },
+    { "WowCloudsSave", Script_WowCloudsSave },
+    { "WowCloudsReload", Script_WowCloudsReload },
+};
+
+// Registers our Lua functions on whichever Lua state is active. The state is replaced on every
+// glue <-> world transition (login screen, logout), so this re-registers when the pointer changes,
+// and only once it has stayed the same for ~1 second (so the engine has finished populating it).
+static void LuaBridgeTick() {
+    static void* s_pendingState = NULL;
+    static void* s_doneState = NULL;
+    static DWORD s_seenFrame = 0;
+    static DWORD s_lastRegFrame = 0;
+    if (!g_cfg.luaBridge) return;
+
+    void* L = NULL;
+    __try { L = *(void**)GameAddr(LUA_ADDR_STATE_VAR); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!L) return;
+    if (L != s_pendingState) {
+        s_pendingState = L;
+        s_seenFrame = g_frame;
+        LogAlways("[lua] active lua_State is now %p (frame %lu)", L, (unsigned long)g_frame);
+        return;
+    }
+    if (g_frame - s_seenFrame < 60) return;
+
+    // Register once the state has been stable for ~1 s. After that, keep re-registering every ~5 s:
+    // the engine can tear down and rebuild its Lua state (login <-> world), and a new state may be
+    // allocated at the very same address as the old one, which a pointer comparison alone can't
+    // tell apart -- the functions would then be missing from the new state. Registering is just
+    // setting a global, so repeating it is harmless.
+    bool firstTime = (L != s_doneState);
+    if (!firstTime && g_frame - s_lastRegFrame < 300) return;
+    s_doneState = L;
+    s_lastRegFrame = g_frame;
+
+    __try {
+        FrameScriptRegisterFunction_t reg = (FrameScriptRegisterFunction_t)GameAddr(LUA_ADDR_REGISTER_FUNCTION);
+        for (int k = 0; k < (int)(sizeof(g_luaExports) / sizeof(g_luaExports[0])); k++) reg(g_luaExports[k].name, g_luaExports[k].fn);
+        if (firstTime) LogAlways("[lua] registered %d functions on lua_State %p (frame %lu)", (int)(sizeof(g_luaExports) / sizeof(g_luaExports[0])), L, (unsigned long)g_frame);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (firstTime) LogAlways("[lua] registering the Lua functions raised an exception");
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE H_Present(IDirect3DDevice9* d, const RECT* a, const RECT* b, HWND w, const RGNDATA* r) {
     VT* t = FindVT(d);
     if (g_cfg.skyDump && g_skyOrd > 0 && (g_frame % 600 == 300 || g_frame % 600 == 301)) g_dbgDumpFrames++;
     g_frame++;
+    LuaBridgeTick();
     if (g_worldDrawn && !g_drawnThisFrame && g_dbgAttnLogs < 20) {
         g_dbgAttnLogs++;
         LogDbg("[frame %lu] WARNING: the world was drawn, but the clouds were not drawn.", g_frame);
@@ -1569,6 +2020,8 @@ static HRESULT STDMETHODCALLTYPE H_Present(IDirect3DDevice9* d, const RECT* a, c
     g_skyOrd = 0;
     g_skyEnded = false;
     g_skyCloudsTriggeredThisFrame = false;
+    g_skyGradSeen = false;
+    g_skyEarlyZ = 0;
     g_pendingSkyClouds = false;
     g_worldDraws = 0;
     g_worldPrims = 0;
@@ -1674,6 +2127,7 @@ static HRESULT STDMETHODCALLTYPE H_Reset(IDirect3DDevice9* d, D3DPRESENT_PARAMET
     if (g_sb) { g_sb->Release(); g_sb = NULL; }   // the state blocks must be released before Reset.
     g_curRT = NULL; g_worldRT = NULL;
     ReleaseSampleBuffers();   // DEFAULT pool surfaces: must be released before Reset
+    ReleaseCloudRT();         // same reason
     return t->reset(d, pp);
 }
 
