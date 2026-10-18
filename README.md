@@ -26,6 +26,10 @@ You can add presets for any zone in the game using their id and add it to a pres
 
 ![Image](https://github.com/Newmansk/WoW-Clouds/blob/main/media/burningSteppes.gif)
 
+## Addon interface for editing
+
+![Image](https://github.com/Newmansk/WoW-Clouds/blob/main/media/AddonUI.png)
+
 ## Compatibility (Tested)
 
 | Component | Configuration |
@@ -56,9 +60,9 @@ VanillaFixes is an external dependency and must be installed and configured sepa
 
 ## Configuration
 
-A dedicated in-game addon for real-time configuration is not available yet.
+- use **/wcc** in the chat to open configuration menu.
 
-For now, you can customize the mod by editing `wow_clouds.ini` while the game is running. Modify the available settings to adjust the cloud appearance and behavior to your preferences.
+Since specific zone presets are user-customizable you still have to edit them in the .ini file
 
 The configuration file is automatically reloaded while the game is running, so restarting the client should not normally be necessary.
 
